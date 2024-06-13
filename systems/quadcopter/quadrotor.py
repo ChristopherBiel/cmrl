@@ -36,7 +36,7 @@ class quadrotor():
         '''
 
         # load parameters and convert to . dict format
-        load_params = json.load(open("parameters.json"))
+        load_params = json.load(open("systems/quadcopter/parameters.json"))
         params = Munch.fromDict(load_params)
 
         return params
