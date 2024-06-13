@@ -27,3 +27,6 @@ out/
 log/
 logs/
 output/
+
+# VS Code files
+.vscode/
