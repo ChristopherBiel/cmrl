@@ -59,16 +59,14 @@ class QuadCopterEnv(Env):
         # Calculate the motor pwm from action
         motor_pwn = self._compute_motor_pwm(action[0], action[1:], self.quad.params)
         sq_mot_rates = self._motor_state_update(motor_pwn, self.quad.params)
-        sys_state = self._quad_state_update(state, sq_mot_rates, self.params, self._dynamics_type, self._disturb)
+        
         # quadrotor dynamics
-        obs = sys_state.full_state
-        # Calculate the reward
-        reward = self.reward(state.obs, action)
+        state = self._quad_state_update(state, sq_mot_rates, self.params, self._dynamics_type, self._disturb)
 
-        # Done
-        if state.full_state[2] < 0.0:
-            done = jnp.array(1.0)
-        return State(pipeline_state, obs, reward, done, metrics)
+        # Calculate the reward
+        reward = self.reward(state, action)
+
+        return State(pipeline_state, state.obs, reward, state.done, state.metrics)
 
     @property
     def dt(self):
@@ -85,36 +83,40 @@ class QuadCopterEnv(Env):
         # Where p, q, r are the roll, pitch, and yaw rates respectively
         return 4
     
-    def _init_zero_state(self,
-                         init_state: chex.Array | None = None) -> Munch:
-        state = {
-            "x" : 0.0,
-            "y" : 0.0,
-            "z" : 0.0,
-            "vx" : 0.0,
-            "vy" : 0.0,
-            "vz" : 0.0,
-            "ax" : 0.0,
-            "ay" : 0.0,
-            "az" : 0.0,
-            "roll"  : 0.0,
-            "pitch" : 0.0,
-            "yaw"   : 0.0,
-            "p" : 0.0,
-            "q" : 0.0,
-            "r" : 0.0,
-            "R" : jnp.eye(3),
-            "quat" : jnp.array([1.0, 0.0, 0.0, 0.0])
-        }
+    def _init_zero_state(self) -> State:
+        
+        observation = jnp.zeros(12)
+        state = State(pipeline_state=None,
+                      obs=observation,
+                      reward=0.0,
+                      done=0.0,
+                      metrics={
+                          'time': 0.0,
+                          'R': jnp.eye(3),
+                          'quat': jnp.array([1.0, 0.0, 0.0, 0.0]),
+                          'acc': jnp.zeros(3),
+                      })
 
-        # convert dict to . dict format
-        state = Munch.fromDict(state)
-        # construct full state array
-        state.full_state = jnp.array([state.x, state.y, state.z,
-                           state.vx, state.vy, state.vz,
-                           state.roll, state.pitch, state.yaw,
-                           state.p, state.q, state.r])
         return state
+    
+    def _init_state(self,
+                    init_state: chex.Array | None = None) -> Munch:
+        if init_state is None:
+            state = self._init_zero_state()
+            return state
+        
+        R = self._quat2rotation(self._euler2quat(init_state[6], init_state[7], init_state[8]))
+        state = State(pipeline_state=None,
+                      obs=init_state,
+                      reward=0.0,
+                      done=0.0,
+                      metrics={
+                          'time': 0.0,
+                          'R': jnp.eye(3),
+                          'quat': jnp.array([1.0, 0.0, 0.0, 0.0]),
+                          'acc': jnp.zeros(3),
+                      })
+
     
     def _compute_motor_pwm(self,
                            base_thrust: chex.Array,
@@ -123,12 +125,6 @@ class QuadCopterEnv(Env):
                              [-0.5, +0.5, +1.0],
                              [+0.5, +0.5, -1.0],
                              [+0.5, -0.5, +1.0]])
-        """
-        temp = np.array([[+0.5, -0.5, -1.0],
-                             [-0.5, -0.5, +1.0],
-                             [-0.5, +0.5, -1.0],
-                             [+0.5, +0.5, +1.0]])
-        """
         adjustment = temp.dot(motor_variation)
         motor_pwm = base_thrust + adjustment
         motor_pwm = jnp.maximum(motor_pwm, self.params.quad.thrust_min)
@@ -151,4 +147,86 @@ class QuadCopterEnv(Env):
                            sq_mot_rates: chex. Array,
                            params: Munch,
                            dynamic_type: str,
-                           disturb: bool) -> Munch
+                           disturb: bool) -> Munch:
+        R_w2b = state.metrics["R"]
+
+        # compute thrust
+        thrust_b = params.quad.ct * jnp.sum(sq_mot_rates)
+        thrust_w = R_w2b.dot(jnp.array([0, 0, thrust_b]))
+
+        # compute net force
+        grav_force = -params.quad.m * params.quad.g
+        net_force = thrust_w + jnp.array([0, 0, grav_force])
+
+        # compute acceleration
+        acc = net_force / params.quad.m
+
+        # compute moment
+        alpha = params.quad.l * params.quad.ct / jnp.sqrt(2)
+        beta = params.quad.cd
+
+        moment_x = alpha * jnp.sum(jnp.array([-1, -1, 1, 1]) * sq_mot_rates)
+        moment_y = alpha * jnp.sum(jnp.array([-1, 1, 1, -1]) * sq_mot_rates)
+        moment_z = beta * jnp.sum(jnp.array([-1, 1, -1, 1]) * sq_mot_rates)
+
+        moment = jnp.array([moment_x, moment_y, moment_z])
+
+        # compute inertia
+        I = jnp.diag(jnp.array([params.quad.Ixx, params.quad.Iyy, params.quad.Izz]))
+        I_inv = jnp.linalg.inv(I)
+        pqr = state.full_state[9:]
+        temp0 = moment - jnp.cross(pqr, I.dot(pqr))
+        angular_rate_derivative = I_inv.dot(temp0)
+
+        # compute rpy angles
+        omega = pqr + params.sim.dt * angular_rate_derivative
+
+        if dynamic_type == "quat":
+            # update based on quaternion
+            quat_next = self._quat_update(state.metrics["quat"], pqr, params.sim.dt)
+            R_next = self._quat2rotation(quat_next)
+            rpy_next = self._rotation2euler(R_next)
+
+        elif dynamic_type == "euler":
+            # update based on euler angle
+            rpy = state.full_state[6:9]
+            rpy_next = self._euler_update(rpy, pqr, params.sim.dt)
+            quat_next = self._euler2quat(rpy_next[0], rpy_next[1], rpy_next[2])
+            R_next = self._quat2rotation(quat_next)
+
+        # update state
+        x = state.x + params.sim.dt * state.vx
+        y = state.y + params.sim.dt * state.vy
+        z = state.z + params.sim.dt * state.vz
+        vx = state.vx + params.sim.dt * state.ax
+        state.vy = state.vy + params.sim.dt * state.ay
+        state.vz = state.vz + params.sim.dt * state.az
+        state.roll = rpy_next[0]
+        state.pitch = rpy_next[1]
+        state.yaw = rpy_next[2]
+        state.p = omega[0]
+        state.q = omega[1]
+        state.r = omega[2]
+        state.R = R_next
+        state.quat = quat_next
+        state.full_state = jnp.array([state.x, state.y, state.z,
+                                      state.vx, state.vy, state.vz,
+                                      state.roll, state.pitch, state.yaw,
+                                      state.p, state.q, state.r])
+        
+
+
+    def _quat_update(self):
+        pass
+
+    def _quat2rotation(self):
+        pass
+
+    def _rotation2euler(self):
+        pass
+
+    def _euler_update(self):
+        pass
+
+    def _euler2quat(self):
+        pass
