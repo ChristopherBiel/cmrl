@@ -2,7 +2,8 @@ from setuptools import setup, find_packages
 
 required = [
     'model-based-rl @ git+https://github.com/lasgroup/model-based-rl.git',
-    'diff-smoothers @ git+https://github.com/christopherbiel/differentiating-smoother.git'
+    'diff-smoothers @ git+https://github.com/christopherbiel/differentiating-smoother.git',
+    'Munch',
 ]
 
 extras = {}

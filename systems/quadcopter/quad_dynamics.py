@@ -1,145 +1,145 @@
-# general
-import math
-import numpy as np
+import jax
+import jax.numpy as jnp
+import jax.random as jr
+import chex
+from brax.envs.base import State, Env
+from munch import Munch
+from scipy.spatial.transform import Rotation
 
-# utilities
-from helper import rotation_x, rotation_y, rotation_z
-from helper import euler2quat, quat2rotation, rotation2euler
-from helper import update_full_state
+def _compute_motor_pwm(params: Munch,
+                       base_thrust: chex.Array,
+                       motor_variation: chex.Array) -> chex.Array:
+    temp = jnp.array([[-0.5, -0.5, -1.0],
+                            [-0.5, +0.5, +1.0],
+                            [+0.5, +0.5, -1.0],
+                            [+0.5, -0.5, +1.0]])
+    adjustment = temp.dot(motor_variation)
+    motor_pwm = base_thrust + adjustment
+    motor_pwm = jnp.maximum(motor_pwm, jnp.asarray(params.quad.thrust_min))
+    motor_pwm = jnp.minimum(motor_pwm, jnp.asarray(params.quad.thrust_max))
 
-def rotation_matrix(roll, pitch, yaw):
-    """ find rotation matrix """
+    return motor_pwm
 
-    rot_x = rotation_x(roll)
-    rot_y = rotation_y(pitch)
-    rot_z = rotation_z(yaw)
+def _motor_state_update(params: Munch,
+                        pwm: chex. Array) -> chex.Array:
+    """ computes motor squared rpm from pwm """
+    motor_rates = params.quad.pwm2rpm_scale * pwm + params.quad.pwm2rpm_const
+    squared_motor_rates = motor_rates ** 2
+    return squared_motor_rates
 
-    R_b2w = rot_z.dot(rot_y).dot(rot_x)
+def _quad_state_update(params: Munch,
+                       state: State,
+                       sq_mot_rates: chex. Array,
+                       disturb: bool) -> State:
+    R_w2b = state.metrics["R"]
 
-    rot_x = rotation_x(-roll)
-    rot_y = rotation_y(-pitch)
-    rot_z = rotation_z(-yaw)
+    # compute thrust
+    thrust_b = params.quad.ct * jnp.sum(sq_mot_rates)
+    thrust_w = R_w2b.dot(jnp.array([0, 0, thrust_b]))
 
-    R_w2b = rot_x.dot(rot_y).dot(rot_z)
+    # compute net force
+    grav_force = -params.quad.m * params.quad.g
+    net_force = thrust_w + jnp.array([0, 0, grav_force])
 
-    return R_w2b, R_b2w
+    # compute acceleration
+    acc = net_force / params.quad.m
 
-def quat_update(cur_quat, pqr, dt):
-    vector_cross = np.array([[cur_quat[0], -cur_quat[3], cur_quat[2]],
-                    [cur_quat[3], cur_quat[0], -cur_quat[1]],
-                    [-cur_quat[2], cur_quat[1], cur_quat[0]]])
+    # compute moment
+    alpha = params.quad.l * params.quad.ct / jnp.sqrt(2)
+    beta = params.quad.cd
+
+    moment_x = alpha * jnp.sum(jnp.array([-1, -1, 1, 1]) * sq_mot_rates)
+    moment_y = alpha * jnp.sum(jnp.array([-1, 1, 1, -1]) * sq_mot_rates)
+    moment_z = beta * jnp.sum(jnp.array([-1, 1, -1, 1]) * sq_mot_rates)
+
+    moment = jnp.array([moment_x, moment_y, moment_z])
+
+    # compute inertia
+    I = jnp.diag(jnp.array([params.quad.Ixx, params.quad.Iyy, params.quad.Izz]))
+    I_inv = jnp.linalg.inv(I)
+    pqr = state.obs[9:]
+    temp0 = moment - jnp.cross(pqr, I.dot(pqr))
+    angular_rate_derivative = I_inv.dot(temp0)
+
+    dt = params.sim.dt
+    # compute rpy angles
+    omega = pqr + dt * angular_rate_derivative
+
+    # update based on quaternion
+    quat_next = _quat_update(state.metrics["quat"], pqr, dt)
+    R_next = _quat2rotation(quat_next)
+    rpy_next = _rotation2euler(R_next)
+
+    # update state
+    obs = jnp.array([
+        state.obs[0] + dt * state.obs[3],
+        state.obs[1] + dt * state.obs[4],
+        state.obs[2] + dt * state.obs[5],
+        state.obs[3] + dt * acc[0],
+        state.obs[4] + dt * acc[1],
+        state.obs[5] + dt * acc[2],
+        rpy_next[0],
+        rpy_next[1],
+        rpy_next[2],
+        omega[0],
+        omega[1],
+        omega[2]
+    ])
+
+    metrics = {
+        'time': state.metrics["time"] + dt,
+        'R': R_next,
+        'quat': quat_next,
+        'acc': acc
+    }
+
+    # Check if done
+    if state.metrics["time"] > params.sim.t1 or \
+        jnp.any(jnp.abs(obs[:3]) > params.sim.pos_lim):
+        done = 1.0
+    else:
+        done = 0.0
+
+    return State(pipeline_state=None,
+                    obs=obs,
+                    reward=0.0,
+                    done=done,
+                    metrics=metrics)
+
+def _quat_update(cur_quat: chex.Array,
+                 pqr: chex.Array,
+                 dt: float) -> chex.Array:
+    """Update quaternion based on angular rates pqr"""
+    vector_cross = jnp.array([[cur_quat[0], -cur_quat[3], cur_quat[2]],
+                                [cur_quat[3], cur_quat[0], -cur_quat[1]],
+                                [-cur_quat[2], cur_quat[1], cur_quat[0]]])
 
     # update angle and axis
     quat_w_next = -0.5 * cur_quat[1:].dot(pqr) * dt
     quat_axis_next = 0.5 * vector_cross.dot(pqr) * dt
 
     # update quaternion
-    quat_next = np.append(quat_w_next, quat_axis_next) + cur_quat
-
-    # normalize quaternion
-    quat_next /= np.linalg.norm(quat_next)
-
+    quat_next = jnp.append(quat_w_next, quat_axis_next) + cur_quat
+    quat_next /= jnp.linalg.norm(quat_next)
     return quat_next
 
-# TODO: check this agianst the cpp simulator
-def euler_update(rpy, pqr, dt):
-    # update euler angles
-    rpy_next = rpy + dt * pqr
+def _quat2rotation(quat: chex.Array) -> chex.Array:
+    """ convert quaternion to rotation matrix """
+    w,x,y,z = quat
+    r = Rotation.from_quat([x,y,z,w])
+    return r.as_matrix()
 
-    # wrap angles
-    for i in range(len(rpy_next)):
-        rpy_next[i] = rpy_next[i] % (2 * math.pi)
-        if rpy_next[i] > math.pi:
-            rpy_next[i] -= (2 * math.pi)
+def _rotation2euler(R: chex.Array) -> chex.Array:
+    """ convert rotation matrix to euler """
+    r = Rotation.from_matrix(R)
+    euler = r.as_euler('XYZ', degrees=False)
+    return euler
 
-    return rpy_next
-
-def quad_state_update(curr_state, squared_motor_rates, params, rot_update_type, disturb):
-    # compute rotation matrix
-    # R_w2b, R_b2w = rotation_matrix(curr_state.roll, curr_state.pitch, curr_state.yaw)
-    R_w2b = curr_state.R
-
-    # compute thurst
-    thrust_b = params.quad.ct * np.sum(squared_motor_rates)
-    thrust_w = R_w2b.dot(np.array([0, 0, thrust_b]))
-
-    # compute net force
-    force = -params.quad.m * params.quad.g
-    net_force = thrust_w + np.array([0, 0, force])
-
-    # compute acceleration
-    acc = net_force / params.quad.m
-
-    # compute moment
-    alpha = params.quad.l * params.quad.ct / math.sqrt(2)
-    beta = params.quad.cd
-
-    moment_x = alpha * np.sum(np.array([-1, -1, 1, 1]) * squared_motor_rates)
-    moment_y = alpha * np.sum(np.array([-1, 1, 1, -1]) * squared_motor_rates)
-    moment_z = beta * np.sum(np.array([-1, 1, -1, 1]) * squared_motor_rates)
-
-    moment = np.array([moment_x, moment_y, moment_z])
-
-    # compute inertia
-    J = np.diag([params.quad.Ixx, params.quad.Iyy, params.quad.Izz])
-    J_inv = np.linalg.inv(J)
-    pqr = np.array([curr_state.p, curr_state.q, curr_state.r])
-    temp0 = moment - np.cross(pqr, J.dot(pqr))
-    angular_rate_derivative = J_inv.dot(temp0)
-
-    # compute rpy angles
-    omega = pqr + params.sim.dt * angular_rate_derivative
-
-    if rot_update_type == "quat":
-        # update based on quaternion
-        quat_next = quat_update(curr_state.quat, pqr, params.sim.dt)
-        R_next = quat2rotation(quat_next)
-        rpy_next = rotation2euler(R_next)
-
-    elif rot_update_type == "euler":
-        # update based on euler angle
-        rpy = np.array([curr_state.roll, curr_state.pitch, curr_state.yaw])
-        rpy_next = euler_update(rpy, pqr, params.sim.dt)
-        quat_next = euler2quat(rpy_next[0], rpy_next[1], rpy_next[2])
-        R_next = quat2rotation(quat_next)
-
-    else:
-        print("Invalid update type for rotational dynamics")
-
-    # populate next_state
-    next_state = curr_state
-
-    next_state.x = curr_state.x + params.sim.dt * curr_state.vx
-    next_state.y = curr_state.y + params.sim.dt * curr_state.vy
-    next_state.z = curr_state.z + params.sim.dt * curr_state.vz
-
-    if disturb:
-        curr_state.az += 3000
-
-    next_state.vx = curr_state.vx + params.sim.dt * curr_state.ax
-    next_state.vy = curr_state.vy + params.sim.dt * curr_state.ay
-    next_state.vz = curr_state.vz + params.sim.dt * curr_state.az
-
-    next_state.ax = acc[0]
-    next_state.ay = acc[1]
-    next_state.az = acc[2]
-
-    next_state.p = omega[0]
-    next_state.q = omega[1]
-    next_state.r = omega[2]
-
-    next_state.quat = quat_next
-    next_state.R = R_next
-    next_state.roll = rpy_next[0]
-    next_state.pitch = rpy_next[1]
-    next_state.yaw = rpy_next[2]
-
-    next_state.full_state = update_full_state(next_state)
-
-    return next_state
-
-def main():
-    quad_state_update()
-
-if __name__ == "__main__":
-    main()
+def _euler2quat(roll: float,
+                pitch: float,
+                yaw: float) -> chex.Array:
+    """ convert euler angles to quaternion """
+    r = Rotation.from_euler('XYZ', [roll, pitch, yaw], degrees=False)
+    x,y,z,w = r.as_quat()
+    quat = jnp.array([w,x,y,z])
+    return quat
