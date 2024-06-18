@@ -2,6 +2,8 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 import chex
+
+import numpy as np
 from brax.envs.base import State, Env
 from munch import Munch
 from scipy.spatial.transform import Rotation
@@ -94,11 +96,10 @@ def _quad_state_update(params: Munch,
     }
 
     # Check if done
-    if state.metrics["time"] > params.sim.t1 or \
-        jnp.any(jnp.abs(obs[:3]) > params.sim.pos_lim):
-        done = 1.0
-    else:
-        done = 0.0
+    condition1 = state.metrics["time"] > params.sim.t1
+    condition2 = jnp.any(jnp.abs(obs[:3]) > params.sim.pos_lim)
+    
+    done = jnp.where(condition1 | condition2, 1.0, 0.0)
 
     return State(pipeline_state=None,
                     obs=obs,
@@ -125,21 +126,70 @@ def _quat_update(cur_quat: chex.Array,
 
 def _quat2rotation(quat: chex.Array) -> chex.Array:
     """ convert quaternion to rotation matrix """
-    w,x,y,z = quat
-    r = Rotation.from_quat([x,y,z,w])
-    return r.as_matrix()
+    w, x, y, z = quat
+
+    # Compute the elements of the rotation matrix
+    r11 = 1 - 2 * (y**2 + z**2)
+    r12 = 2 * (x * y - z * w)
+    r13 = 2 * (x * z + y * w)
+    
+    r21 = 2 * (x * y + z * w)
+    r22 = 1 - 2 * (x**2 + z**2)
+    r23 = 2 * (y * z - x * w)
+    
+    r31 = 2 * (x * z - y * w)
+    r32 = 2 * (y * z + x * w)
+    r33 = 1 - 2 * (x**2 + y**2)
+    
+    # Assemble the rotation matrix
+    rotation_matrix = jnp.array([
+        [r11, r12, r13],
+        [r21, r22, r23],
+        [r31, r32, r33]
+    ])
+    
+    return rotation_matrix
 
 def _rotation2euler(R: chex.Array) -> chex.Array:
-    """ convert rotation matrix to euler """
-    r = Rotation.from_matrix(R)
-    euler = r.as_euler('XYZ', degrees=False)
-    return euler
+    """ convert rotation matrix to euler (xyz convention)"""
+    # Extract the angles from the rotation matrix
+    sy = jnp.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
+    
+    alpha = jnp.where(sy >= 1e-6,
+                      jnp.arctan2(R[2, 1], R[2, 2]),
+                      jnp.arctan2(-R[1, 2], R[1, 1]))
+    
+    beta = jnp.where(sy >= 1e-6,
+                     jnp.arctan2(-R[2, 0], sy),
+                     jnp.arctan2(-R[2, 0], sy))
+    
+    gamma = jnp.where(sy >= 1e-6,
+                      jnp.arctan2(R[1, 0], R[0, 0]),
+                      jnp.zeros_like(R[0, 0]))  # gamma is 0 when sy is small
+    
+    return jnp.array([alpha, beta, gamma])
 
 def _euler2quat(roll: float,
                 pitch: float,
                 yaw: float) -> chex.Array:
-    """ convert euler angles to quaternion """
-    r = Rotation.from_euler('XYZ', [roll, pitch, yaw], degrees=False)
-    x,y,z,w = r.as_quat()
-    quat = jnp.array([w,x,y,z])
-    return quat
+    """ convert euler angles (xyz convention) to quaternion """
+    
+    half_roll = roll / 2.0
+    half_pitch = pitch / 2.0
+    half_yaw = yaw / 2.0
+    
+    cos_half_roll = jnp.cos(half_roll)
+    sin_half_roll = jnp.sin(half_roll)
+    
+    cos_half_pitch = jnp.cos(half_pitch)
+    sin_half_pitch = jnp.sin(half_pitch)
+    
+    cos_half_yaw = jnp.cos(half_yaw)
+    sin_half_yaw = jnp.sin(half_yaw)
+    
+    w = cos_half_roll * cos_half_pitch * cos_half_yaw + sin_half_roll * sin_half_pitch * sin_half_yaw
+    x = sin_half_roll * cos_half_pitch * cos_half_yaw - cos_half_roll * sin_half_pitch * sin_half_yaw
+    y = cos_half_roll * sin_half_pitch * cos_half_yaw + sin_half_roll * cos_half_pitch * sin_half_yaw
+    z = cos_half_roll * cos_half_pitch * sin_half_yaw - sin_half_roll * sin_half_pitch * cos_half_yaw
+    
+    return jnp.array([w, x, y, z])
