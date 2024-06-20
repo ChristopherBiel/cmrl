@@ -56,22 +56,31 @@ class QuadCopterEnv(Env):
         return 0.0
     
     def step(self,
-             state: State,
+             input_state: State,
              action: chex.Array) -> State:
         """Step the quadrotor dynamics forward in time."""
-        pipeline_state = None
 
         # Calculate the motor pwm from action
         motor_pwn = _compute_motor_pwm(self.params, action[0], action[1:])
         sq_mot_rates = _motor_state_update(self.params, motor_pwn)
         
         # quadrotor dynamics
-        state = _quad_state_update(self.params, state, sq_mot_rates, self._disturb)
+        next_state = _quad_state_update(self.params, input_state, sq_mot_rates, self._disturb)
+        # Combine the state metrics
+        input_state.metrics['time'] = next_state.metrics['time']
+        input_state.metrics['R'] = next_state.metrics['R']
+        input_state.metrics['quat'] = next_state.metrics['quat']
+        input_state.metrics['acc'] = next_state.metrics['acc']
 
         # Calculate the reward
-        reward = self.reward(state, action)
+        reward = self.reward(next_state, action)
 
-        return State(pipeline_state, state.obs, reward, state.done, state.metrics)
+        return State(pipeline_state=input_state.pipeline_state,
+                     obs=next_state.obs,
+                     reward=reward,
+                     done=next_state.done,
+                     metrics=input_state.metrics,
+                     info=input_state.info)
 
     @property
     def dt(self):

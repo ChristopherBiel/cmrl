@@ -3,6 +3,7 @@ import jax.random as jr
 from jax.nn import swish
 import wandb
 
+from distrax import Normal
 from brax.training.types import Transition
 from brax.training.replay_buffers import UniformSamplingQueue
 from mbpo.optimizers import SACOptimizer
@@ -10,6 +11,8 @@ from mbpo.systems.rewards.base_rewards import Reward
 from bsm.statistical_model.bnn_statistical_model import BNNStatisticalModel
 from systems.quadcopter.environment import QuadCopterEnv
 from mbrl.model_based_agent.optimistic_model_based_agent import OptimisticModelBasedAgent
+from CustomModelBasedAgent import ContModelBasedAgent
+from differentiators.nn_smoother.smoother_net import SmootherNet
 
 class DroneReward(Reward):
     def __init__(self):
@@ -24,13 +27,14 @@ class DroneReward(Reward):
         assert x.shape == (12,) and u.shape == (4,)
         # Reward is the negative distance to the origin
         reward = -jnp.linalg.norm(x[:3]) + 5
-        return reward, reward_params
+        reward_dist = Normal(reward, jnp.zeros_like(reward))
+        return reward_dist, reward_params
 
     def init_params(self, key: jnp.ndarray) -> dict:
         return {}
 
 def experiment():
-    #wandb.init(project='CMRL-Test_Drone')
+    wandb.init(project='CMRL-Test_Drone')
 
     env = QuadCopterEnv()
     cur_state = env.reset()
@@ -46,6 +50,20 @@ def experiment():
         return_best_model = True,
         eval_batch_size = 64,
         train_share = 0.8,
+        eval_frequency = 1_000,
+    )
+
+    smoother_model = SmootherNet(
+        input_dim = 1,
+        output_dim = env.observation_size,
+        num_training_steps = 4_000,
+        output_stds = 1e-3 * jnp.ones(env.observation_size),
+        features = (64, 64),
+        num_particles = 5,
+        logging_wandb = False,
+        return_best_model = True,
+        eval_batch_size = 64,
+        train_share = 1.0,
         eval_frequency = 1_000,
     )
 
